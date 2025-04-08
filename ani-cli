@@ -80,6 +80,8 @@ help_info() {
         Exit the player, and return the player exit code (useful for non interactive scenarios, works only if --no-detach is used, mpv only)
       --skip-title <title>
         Use given title as ani-skip query
+      --anilist
+        Use AniList to get the watching list
       -N, --nextep-countdown
         Display a countdown to the next episode
       -U, --update
@@ -101,7 +103,7 @@ version_info() {
 }
 
 update_script() {
-    update="$(curl -s -A "$agent" "https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli")" || die "Connection error"
+    update="$(curl -s -A "$agent" "https://raw.githubusercontent.com/antipixelhd/ani-cli/master/ani-cli")" || die "Connection error"
     update="$(printf '%s\n' "$update" | diff -u "$0" -)"
     if [ -z "$update" ]; then
         printf "Script is up to date :)\n"
@@ -327,7 +329,7 @@ play() {
     line_count=$(printf "%s\n" "$ep_no" | wc -l | tr -d "[:space:]")
     if [ "$line_count" != 1 ] || [ -n "$start" ]; then
         [ -z "$start" ] && start=$(printf "%s\n" "$ep_no" | head -n1)
-        [ -z "$end" ] && end=$(printf "%s\n" "$ep_no" | tail -n1)
+        [ -z "$end" ] && end=$(printf "%s" "$ep_no" | tail -n1)
         range=$(printf "%s\n" "$ep_list" | sed -nE "/^${start}\$/,/^${end}\$/p")
         [ -z "$range" ] && die "Invalid range!"
         for i in $range; do
@@ -341,6 +343,130 @@ play() {
     fi
     # moves up to stored position and deletes to end
     [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && tput rc && tput ed
+}
+
+# ANILIST INTEGRATION
+
+data_dir="${HOME}/.local/share/ani-cli"
+
+# Global variables for AniList credentials
+anilist_token=""
+anilist_user_id=""
+
+check_anilist_credentials() {
+    [ ! -d "$data_dir" ] && mkdir -p "$data_dir"
+    [ -f "$data_dir/anilist_token.txt" ] && anilist_token=$(cat "$data_dir/anilist_token.txt")
+    [ -z "$anilist_token" ] && printf "Paste your access token from this page:\nhttps://anilist.co/api/v2/oauth/authorize?client_id=25773&response_type=token : " && read -r anilist_token &&
+        echo "$anilist_token" >"$data_dir/anilist_token.txt"
+    [ -f "$data_dir/anilist_user_id.txt" ] && anilist_user_id=$(cat "$data_dir/anilist_user_id.txt")
+    [ -z "$anilist_token" ] && exit 1
+    [ -z "$anilist_user_id" ] &&
+        anilist_user_id=$(curl -s -X POST "https://graphql.anilist.co" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -H "Authorization: Bearer $anilist_token" \
+            -d "{\"query\":\"query { Viewer { id } }\"}" | sed -nE "s@.*\"id\":([0-9]*).*@\1@p") &&
+        echo "$anilist_user_id" >"$data_dir/anilist_user_id.txt"
+}
+
+
+get_watching_list() {
+    # Now get the watching list with the user ID
+    query="query {
+        MediaListCollection(userId: $anilist_user_id, type: ANIME, status: CURRENT) {
+            lists {
+                entries {
+                    media {
+                        id
+                        title {
+                            romaji
+                            english
+                            native
+                        }
+                        episodes
+                        nextAiringEpisode {
+                            episode
+                            timeUntilAiring
+                        }
+                    }
+                    progress
+                    status
+                }
+            }
+        }
+    }"
+    
+    response=$(curl -s -H "Authorization: Bearer $anilist_token" "https://graphql.anilist.co" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        --data "{\"query\": $(printf "%s" "$query" | jq -s -R .)}")
+    
+    # First check for errors in the response
+    if printf "%s" "$response" | jq -e '.errors' >/dev/null; then
+        printf "\033[1;31mError: AniList API returned an error\033[0m\n"
+        printf "Error details:\n"
+        printf "%s" "$response" | jq -r '.errors[].message' 2>/dev/null || printf "Unknown error\n"
+        exit 1
+    elif printf "%s" "$response" | jq -e '.error' >/dev/null; then
+        printf "\033[1;31mError: AniList API request failed\033[0m\n"
+        printf "Error details:\n"
+        printf "%s" "$response" | jq -r '.error.messages[]' 2>/dev/null || printf "Unknown error\n"
+        exit 1
+    fi
+    
+    # Check if we got a valid response
+    if printf "%s" "$response" | jq -e '.data.MediaListCollection' > /dev/null; then
+        # Extract and format the watching list
+        watching_list=$(printf "%s" "$response" | jq -r '.data.MediaListCollection.lists[].entries[] | select(.media.episodes != null) | "\(.media.id)\t\(.media.title.english // .media.title.romaji // .media.title.native) (\(.progress)/\(.media.episodes) episodes)"')
+        
+        if [ -n "$watching_list" ]; then
+            printf "%s" "$watching_list"
+        else
+            printf "\033[1;31mNo watching anime found for user %s\033[0m\n" "$anilist_user_id"
+            exit 1
+        fi
+    else
+        # Show error message if something went wrong
+        printf "\033[1;31mError: Failed to fetch AniList data\033[0m\n"
+        printf "Response: %s\n" "$response" >&2
+        exit 1
+    fi
+}
+
+update_anilist_progress() {
+    media_id="$1"
+    progress="$2"
+    
+    printf "\033[1;34mUpdating AniList progress...\033[0m\n"
+    printf "Media ID: %s\n" "$media_id"
+    printf "Progress: %s\n" "$progress"
+    
+    mutation='mutation ($id: Int, $progress: Int) {
+        SaveMediaListEntry (mediaId: $id, progress: $progress) {
+            id
+            progress
+            status
+        }
+    }'
+    
+    variables="{\"id\": $media_id, \"progress\": $progress}"
+    
+    printf "Sending request to AniList...\n"
+    response=$(curl -s -H "Authorization: Bearer $anilist_token" "https://graphql.anilist.co" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        --data "{\"query\": $(printf "%s" "$mutation" | jq -s -R .), \"variables\": $variables}")
+    
+    printf "Response from AniList:\n%s\n" "$response"
+    
+    # Check if the update was successful
+    if printf "%s" "$response" | jq -e '.data.SaveMediaListEntry' > /dev/null; then
+        printf "\033[1;32mProgress updated on AniList\033[0m\n"
+    else
+        printf "\033[1;31mFailed to update progress on AniList\033[0m\n"
+        printf "Error details:\n"
+        printf "%s" "$response" | jq -r '.errors[].message' 2>/dev/null || printf "Unknown error\n"
+    fi
 }
 
 # MAIN
@@ -440,6 +566,7 @@ while [ $# -gt 0 ]; do
             ;;
         -N | --nextep-countdown) search=nextep ;;
         -U | --update) update_script ;;
+        --anilist) search="anilist" ;;
         *) query="$(printf "%s" "$query $1" | sed "s|^ ||;s| |+|g")" ;;
     esac
     shift
@@ -448,7 +575,7 @@ done
 [ "$use_external_menu" = "1" ] && multi_selection_flag="${ANI_CLI_MULTI_SELECTION:-"-multi-select"}"
 [ "$external_menu_normal_window" = "1" ] && external_menu_args="-normal-window"
 printf "\33[2K\r\033[1;34mChecking dependencies...\033[0m\n"
-dep_ch "curl" "sed" "grep" || true
+dep_ch "curl" "sed" "grep" "jq" || true
 [ "$skip_intro" = 1 ] && (dep_ch "ani-skip" || true)
 if [ -z "$ANI_CLI_NON_INTERACTIVE" ]; then dep_ch fzf || true; fi
 case "$player_function" in
@@ -463,6 +590,56 @@ esac
 
 # searching
 case "$search" in
+    anilist)
+        # Check credentials once at the start when using --anilist
+        check_anilist_credentials
+        if [ -z "$anilist_token" ] || [ -z "$anilist_user_id" ]; then
+            exit 1
+        fi
+        anime_list=$(get_watching_list)
+        [ -z "$anime_list" ] && die "No watching anime found on AniList!"
+        [ -z "${index##*[!0-9]*}" ] && id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f1)
+        [ -z "${index##*[!0-9]*}" ] || id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f1)
+        [ -z "$id" ] && exit 1
+        
+        # Store the AniList media ID
+        anilist_media_id="$id"
+        
+        # Get the title without episode count
+        title=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed 's/ ([0-9]*\/[0-9]* episodes).*//')
+        anilist_ep_no=$(printf "%s" "$anime_list" | grep "$id" | cut -f2 | sed -nE 's/.*\(([0-9]+)\/[0-9]+ episodes\).*/\1/p')
+        
+        # Search for the anime on the streaming site
+        printf "\33[2K\r\033[1;34mSearching for %s...\033[0m\n" "$title"
+        query=$(printf "%s" "$title" | sed "s| |+|g")
+        anime_list=$(search_anime "$query")
+        [ -z "$anime_list" ] && die "No results found on streaming site!"
+        
+        # Let user select the correct anime if multiple results
+        result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+        [ -z "$result" ] && exit 1
+        
+        # Get the streaming site ID and title
+        id=$(printf "%s" "$result" | cut -f1)
+        title=$(printf "%s" "$result" | cut -f2)
+        allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
+        
+        # Get available episodes
+        ep_list=$(episodes_list "$id")
+        [ -z "$ep_list" ] && die "No episodes found!"
+        
+        # Set episode number to the next unwatched episode
+        ep_no=$((anilist_ep_no + 1))
+        # Format episode number to match the script's expected format
+        ep_no=$(printf "%s" "$ep_no" | sed 's/^0*//')
+        
+        # Check if the episode exists in the list
+        if ! printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
+            printf "\033[1;33mNext episode (%d) not available. Please select an episode:\033[0m\n" "$ep_no"
+            ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
+            [ -z "$ep_no" ] && exit 1
+        fi
+        ;;
     history)
         anime_list=$(while read -r ep_no id title; do process_hist_entry & done <"$histfile")
         wait
@@ -512,9 +689,16 @@ tput sc
 play
 [ "$player_function" = "download" ] || [ "$player_function" = "debug" ] && exit 0
 
+# Update AniList progress if using --anilist
+[ "$search" = "anilist" ] && update_anilist_progress "$anilist_media_id" "$ep_no"
+
 while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth "Playing episode $ep_no of $title... "); do
     case "$cmd" in
-        next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
+        next) 
+            ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
+            # Update AniList progress when moving to next episode
+            [ "$search" = "anilist" ] && update_anilist_progress "$anilist_media_id" "$ep_no"
+            ;;
         replay) episode="$replay" ;;
         previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
         select) ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag") ;;
